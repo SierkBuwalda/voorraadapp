@@ -1,16 +1,28 @@
+
 import dash
 from dash import dcc, html, Input, Output, State, dash_table
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import dash_bootstrap_components as dbc
+import re
 
 SCOPES = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-CREDS_FILE = 'credentials.json'
+CREDS_FILE = 'credentials/credentials.json'
 SHEET_ID = '1t5GqCNNbiBVNbfxkrKA8jgu98ZSO-aQNy8NegHcrFGA'
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
-server = app.server
+def clean_column_names(df):
+    df.columns = [str(col).replace('\xa0', ' ').replace('\u200b', '').strip() for col in df.columns]
+    return df
+
+def list_stock_tabs():
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPES)
+    gc = gspread.authorize(creds)
+    sheet = gc.open_by_key(SHEET_ID)
+    tabs = [ws.title for ws in sheet.worksheets()]
+    stock_tabs = [t for t in tabs if re.match(r"Stock\s+\w+\s+\d{2}", t)]
+    print("📄 Gevonden tabbladen:", stock_tabs)
+    return stock_tabs
 
 def load_data(sheet_name):
     creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPES)
@@ -18,44 +30,62 @@ def load_data(sheet_name):
     sheet = gc.open_by_key(SHEET_ID).worksheet(sheet_name)
     records = sheet.get_all_records()
     df = pd.DataFrame(records)
-    df.columns = df.columns.str.strip()
+    print(f"🔍 Geselecteerd tabblad: {sheet_name}")
+    print(f"📊 Kolommen: {df.columns.tolist()}")
 
+    df = clean_column_names(df)
     for col in ['Aantal', 'Prijs']:
         if col in df.columns:
             df[col] = (
-                df[col]
-                .astype(str)
+                df[col].astype(str)
                 .str.replace('€', '', regex=False)
                 .str.replace(',', '.', regex=False)
                 .str.strip()
                 .replace('', '0')
             )
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-    df['Totaal (€)'] = (df['Aantal'] * df['Prijs']).round(2)
+    if 'Aantal' in df.columns and 'Prijs' in df.columns:
+        df['Totaal (€)'] = (df['Aantal'] * df['Prijs']).round(2)
+    else:
+        df['Totaal (€)'] = 0
     return df
 
 def save_data(sheet_name, df):
     creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPES)
     gc = gspread.authorize(creds)
     worksheet = gc.open_by_key(SHEET_ID).worksheet(sheet_name)
+
+    for col in ['Aantal', 'Prijs', 'Totaal (€)']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    if 'Aantal' in df.columns and 'Prijs' in df.columns:
+        df['Totaal (€)'] = (df['Aantal'] * df['Prijs']).round(2)
+
     worksheet.clear()
     worksheet.update([df.columns.values.tolist()] + df.values.tolist())
 
+# Dash app
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+server = app.server
+
+stock_tabs = list_stock_tabs()
+
 app.layout = dbc.Container([
-    html.Img(src='/assets/kromme_dissel_logo.png', style={'maxWidth': '300px', 'margin': 'auto', 'display': 'block'}),
-    html.H2("Voorraadbeheer Kromme Dissel", style={'textAlign': 'center', 'fontFamily': 'Arial'}),
+    dcc.Location(id='url', refresh=False),
+    html.H2("Voorraadbeheer Kromme Dissel", style={'textAlign': 'center'}),
+    dcc.Store(id='data-store'),
 
     dbc.Row([
         dbc.Col([
-            html.Label("Selecteer maandblad:"),
-            dcc.Dropdown(id='sheet-select',
-                         options=[{'label': 'Stock mei 25', 'value': 'Stock mei 25'}],
-                         value='Stock mei 25')
-        ], md=12)
-    ], className='my-3'),
-
-    dcc.Store(id='data-store'),
+            html.Label("Selecteer maand:"),
+            dcc.Dropdown(
+                id='sheet-select',
+                options=[{'label': s, 'value': s} for s in stock_tabs],
+                value=stock_tabs[0] if stock_tabs else None
+            )
+        ])
+    ], className='mb-3'),
 
     dbc.Row([
         dbc.Col([
@@ -80,7 +110,6 @@ app.layout = dbc.Container([
 
     html.Div(id='totaal-afdeling', style={'fontWeight': 'bold', 'marginTop': '20px'}),
     html.Div(id='totaal-alle', style={'fontWeight': 'bold'}),
-
     html.Button("💾 Opslaan naar Google Sheets", id='save-button', n_clicks=0, style={'marginTop': '30px'})
 ])
 
@@ -88,8 +117,10 @@ app.layout = dbc.Container([
     Output('data-store', 'data'),
     Input('sheet-select', 'value')
 )
-def update_data_store(sheet):
-    df = load_data(sheet)
+def update_data_store(selected_sheet):
+    if not selected_sheet:
+        return []
+    df = load_data(selected_sheet)
     return df.to_dict('records')
 
 @app.callback(
@@ -100,9 +131,10 @@ def update_data_store(sheet):
 )
 def update_afdeling_dropdown(data, huidige_afdeling):
     df = pd.DataFrame(data)
-    afdelingen = sorted(df['Afdeling'].dropna().unique())
+    df = clean_column_names(df)
+    afdelingen = sorted(df['Afdeling'].dropna().unique()) if 'Afdeling' in df.columns else []
     options = [{'label': a, 'value': a} for a in afdelingen]
-    value = huidige_afdeling if huidige_afdeling in afdelingen else afdelingen[0] if afdelingen else None
+    value = huidige_afdeling if huidige_afdeling in afdelingen else (afdelingen[0] if afdelingen else None)
     return options, value
 
 @app.callback(
@@ -114,9 +146,12 @@ def update_afdeling_dropdown(data, huidige_afdeling):
 )
 def update_categorien(afdeling, data, huidige_cat):
     df = pd.DataFrame(data)
+    df = clean_column_names(df)
+    if 'Afdeling' not in df.columns or 'Categorie' not in df.columns:
+        return [], None
     df = df[df['Afdeling'] == afdeling]
     categorien = sorted(df['Categorie'].dropna().unique())
-    value = huidige_cat if huidige_cat in categorien else categorien[0] if categorien else None
+    value = huidige_cat if huidige_cat in categorien else (categorien[0] if categorien else None)
     return [{'label': c, 'value': c} for c in categorien], value
 
 @app.callback(
@@ -124,23 +159,22 @@ def update_categorien(afdeling, data, huidige_cat):
     Output('voorraad-tabel', 'columns'),
     Output('totaal-afdeling', 'children'),
     Output('totaal-alle', 'children'),
+    Input('data-store', 'data'),
     Input('afdeling-select', 'value'),
-    Input('categorie-select', 'value'),
-    State('data-store', 'data')
+    Input('categorie-select', 'value')
 )
-def update_tabel(afdeling, categorie, data):
+def update_tabel(data, afdeling, categorie):
+    if not data:
+        return [], [], "", ""
     df_all = pd.DataFrame(data)
+    df_all = clean_column_names(df_all)
 
     for col in ['Aantal', 'Prijs']:
-        df_all[col] = pd.to_numeric(
-            df_all[col]
-            .astype(str)
-            .str.replace('€', '', regex=False)
-            .str.replace(',', '.', regex=False)
-            .str.strip(),
-            errors='coerce'
-        ).fillna(0)
-
+        if col in df_all.columns:
+            df_all[col] = pd.to_numeric(
+                df_all[col].astype(str).str.replace('€', '').str.replace(',', '.').str.strip(),
+                errors='coerce'
+            ).fillna(0)
     df_all['Totaal (€)'] = (df_all['Aantal'] * df_all['Prijs']).round(2)
 
     df_filter = df_all.copy()
@@ -150,12 +184,7 @@ def update_tabel(afdeling, categorie, data):
         df_filter = df_filter[df_filter['Categorie'] == categorie]
 
     columns = [{'name': col, 'id': col, 'editable': col in ['Aantal', 'Prijs']} for col in df_filter.columns]
-    totaal_selectie = df_filter['Totaal (€)'].sum()
-    totaal_all = df_all['Totaal (€)'].sum()
-
-    return df_filter.to_dict('records'), columns, \
-        f"Totaalwaarde selectie: € {totaal_selectie:,.2f}", \
-        f"Totaalwaarde alle afdelingen: € {totaal_all:,.2f}"
+    return df_filter.to_dict('records'), columns,         f"Totaalwaarde selectie: € {df_filter['Totaal (€)'].sum():,.2f}",         f"Totaalwaarde alle afdelingen: € {df_all['Totaal (€)'].sum():,.2f}"
 
 @app.callback(
     Output('data-store', 'data', allow_duplicate=True),
@@ -166,7 +195,6 @@ def update_tabel(afdeling, categorie, data):
 def update_data_store_live(rows, old_data):
     df_new = pd.DataFrame(rows)
     df_old = pd.DataFrame(old_data)
-
     for idx, row in df_new.iterrows():
         index_in_old = df_old[(df_old['Product'] == row['Product']) & (df_old['Afdeling'] == row['Afdeling'])].index
         if not index_in_old.empty:
@@ -181,9 +209,9 @@ def update_data_store_live(rows, old_data):
     State('data-store', 'data'),
     prevent_initial_call=True
 )
-def save_to_sheets(n_clicks, sheet, data):
+def save_to_sheets(n_clicks, sheet_name, data):
     df = pd.DataFrame(data)
-    save_data(sheet, df)
+    save_data(sheet_name, df)
     return "✅ Opgeslagen naar Google Sheets"
 
 if __name__ == '__main__':
